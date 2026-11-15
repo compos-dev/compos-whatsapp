@@ -155,3 +155,187 @@
                   "a notice gives no message parts")
     (check-equal! (whatsapp--transcript-first "") #f
                   "an empty transcript gives no message parts")))
+
+
+;;; --- the app, over a held MCP seam ----------------------------------------------
+;;; These were whatsapp_test.exs: the list, the conversation, refresh and
+;;; reply, by the commands, with no traffic.
+
+(define t--wa-list "*WhatsApp*")
+(define t--wa-chat "*WhatsApp conversation*")
+(define t--wa-list-fetches 0)
+(define t--wa-message-fetches 0)
+(define t--wa-sent #f)
+
+(define (t--wa-call server tool args &optional cb)
+  (cond
+    ((equal? tool "list_chats")
+     (set! t--wa-list-fetches (+ t--wa-list-fetches 1))
+     "{\"jid\":\"123@s.whatsapp.net\",\"name\":\"Mukund Jha Jha\",\"last_message_time\":\"2026-09-05T11:49:38+05:30\",\"last_message\":\"it's the weekend\",\"last_is_from_me\":1}")
+    ((equal? tool "list_messages")
+     (set! t--wa-message-fetches (+ t--wa-message-fetches 1))
+     (let ((text "[2026-09-05 11:49:38] Chat: Mukund From: Me: it's the weekend\n"))
+       (if cb (cb #t text) text)))
+    ((equal? tool *whatsapp-reply-tool*)
+     (set! t--wa-sent args)
+     (if cb (cb #t "{\"success\":true}") "{\"success\":true}"))
+    (else (if cb (cb #f "unknown tool") ""))))
+
+(define (t--wa-kill!)
+  (when (minibuffer-active?) (minibuffer-cancel!))
+  (for-each (lambda (b) (when (buffer-known? b) (buffer-kill! b))) (list t--wa-list t--wa-chat)))
+
+(define (t--wa-drop-group! name)
+  (let ((id (group-resolve-id name))) (when id (group-record-delete! id))))
+
+;; a frame of its own, the fake seam, and the destination group; all go back
+(define (t--wa! group thunk)
+  (let ((saved-call *whatsapp-call*))
+    (t--wa-kill!)
+    (set! t--wa-list-fetches 0)
+    (set! t--wa-message-fetches 0)
+    (set! t--wa-sent #f)
+    (set! *whatsapp-call* t--wa-call)
+    (with-custom 'whatsapp-group group
+      (lambda () (with-frame (lambda (frame) (thunk)))))
+    (set! *whatsapp-call* saved-call)
+    (t--wa-kill!)
+    (t--wa-drop-group! "whatsapp")))
+
+(define (t--wa-open-chat!)
+  (run-command "whatsapp")
+  (list-goto-first-entry t--wa-list)
+  (with-current-buffer t--wa-list (lambda () (run-command "whatsapp-open"))))
+
+(define (t--wa-reply! buf text)
+  (with-current-buffer buf (lambda () (run-command "whatsapp-reply")))
+  (minibuffer-input! text)
+  (minibuffer-confirm-input!))
+
+(deftest 'whatsapp-app-buffers-can-fill-a-group-layout
+  "the list and the conversation are layout candidates"
+  (lambda ()
+    (t--wa! "whatsapp"
+      (lambda ()
+        (t--wa-open-chat!)
+        (check-true! (fill-candidate? t--wa-chat) "the conversation")
+        (check-true! (fill-candidate? t--wa-list) "the list")))))
+
+(deftest 'whatsapp-named-destination-is-selected-before-the-buffers
+  "whatsapp-group names the group the scene opens in"
+  (lambda ()
+    (t--wa! "zz-whatsapp-destination"
+      (lambda ()
+        (run-command "whatsapp")
+        (check-equal! (group-name (frame-group)) "zz-whatsapp-destination" "the frame moves there")
+        (check-true! (buffer-in-group? t--wa-list "zz-whatsapp-destination") "the list")
+        (check-true! (buffer-in-group? t--wa-chat "zz-whatsapp-destination") "the conversation")))
+    (t--wa-drop-group! "zz-whatsapp-destination")))
+
+(deftest 'whatsapp-filter-narrows-the-chats-locally
+  "the scene puts the list in the index and the conversation in show; a query filters"
+  (lambda ()
+    (t--wa! "whatsapp"
+      (lambda ()
+        (run-command "whatsapp")
+        (check-equal! (group-name (frame-group)) "whatsapp" "the app's group")
+        (check-equal! (window-buffer (scene-window 'index)) t--wa-list "the index")
+        (check-equal! (window-buffer (scene-window 'show)) t--wa-chat "the show pane")
+        (list-set-query! t--wa-list "jha")
+        (check-contains! (buffer-text t--wa-list) "/jha   1 of 1" "one match")
+        (check-contains! (buffer-text t--wa-list) "Mukund Jha Jha" "the chat")
+        (list-set-query! t--wa-list "missing")
+        (check-contains! (buffer-text t--wa-list) "/missing   0 of 1" "no match")
+        (check-false! (string-contains? (buffer-text t--wa-list) "Mukund Jha Jha") "the chat is hidden")))))
+
+(deftest 'whatsapp-open-shows-the-transcript-and-refresh-fetches-again
+  "whatsapp-open reads the transcript as blocks; whatsapp-chat-refresh fetches it again"
+  (lambda ()
+    (t--wa! "whatsapp"
+      (lambda ()
+        (t--wa-open-chat!)
+        (check-equal! (group-name (buffer-group t--wa-chat)) "whatsapp" "in the app's group")
+        (check-contains! (buffer-text t--wa-list) "me: it's the weekend" "the list previews")
+        (check-contains! (buffer-text t--wa-chat) "[2026-09-05 11:49:38] Chat: Mukund From: Me:"
+                         "the transcript as the server printed it")
+        (check-equal! (map whatsapp--msg-sender (whatsapp--messages t--wa-chat)) '("Me") "the sender")
+        (check-equal! (map whatsapp--msg-body (whatsapp--messages t--wa-chat)) '("it's the weekend") "the body")
+        (check-equal! (buffer-local-value 'render-mode t--wa-chat) "blocks" "drawn as blocks")
+        (check-equal! (length (buffer-local-value 'render-blocks t--wa-chat)) 2 "two blocks")
+        (check-equal! (buffer-local-value 'whatsapp-jid t--wa-chat) "123@s.whatsapp.net" "the chat it is")
+        (check-equal! (window-buffer (scene-window 'show)) t--wa-chat "in the show pane")
+        (check-equal! t--wa-message-fetches 1 "one fetch")
+        (with-current-buffer t--wa-chat (lambda () (run-command "whatsapp-chat-refresh")))
+        (check-equal! t--wa-message-fetches 2 "refresh fetches again")))))
+
+(deftest 'whatsapp-reply-from-the-index-goes-to-the-selected-chat
+  "whatsapp-reply on the list sends to the row's chat without opening it"
+  (lambda ()
+    (t--wa! "whatsapp"
+      (lambda ()
+        (run-command "whatsapp")
+        (list-goto-first-entry t--wa-list)
+        (t--wa-reply! t--wa-list "From the index")
+        (check-contains! (value->string t--wa-sent) "recipient \"123@s.whatsapp.net\"" "to the chat")
+        (check-contains! (value->string t--wa-sent) "message \"From the index\"" "the text")
+        (check-equal! t--wa-message-fetches 0 "no transcript fetched")))))
+
+(deftest 'whatsapp-reply-in-a-conversation-quotes-the-message-and-refreshes
+  "the one message on screen is the one answered; the transport has no reply-to"
+  (lambda ()
+    (t--wa! "whatsapp"
+      (lambda ()
+        (t--wa-open-chat!)
+        (t--wa-reply! t--wa-chat "On my way")
+        (check-contains! (value->string t--wa-sent) "recipient \"123@s.whatsapp.net\"" "to the chat")
+        (check-contains! (value->string t--wa-sent) "> Me: it's the weekend" "the quote")
+        (check-contains! (value->string t--wa-sent) "On my way" "the text")
+        (check-equal! t--wa-message-fetches 2 "the send refreshes the transcript")))))
+
+(deftest 'whatsapp-messages-are-the-unit-of-motion-and-a-reply-quotes-the-selected
+  "next and prev walk messages; the reply quotes the one point is on"
+  (lambda ()
+    (t--wa! "whatsapp"
+      (lambda ()
+        (t--wa-open-chat!)
+        (whatsapp--render-conversation! t--wa-chat
+          (string-append
+            "[2026-09-05 11:48:00] Chat: Mukund From: Mukund: are you around\n"
+            "[2026-09-05 11:49:38] Chat: Mukund From: Me: it's the weekend\n"))
+        (check-equal! (length (whatsapp--messages t--wa-chat)) 2 "two messages")
+        (check-equal! (whatsapp--msg-sender (whatsapp--current-message t--wa-chat)) "Mukund" "the top one")
+        (with-current-buffer t--wa-chat (lambda () (run-command "whatsapp-next-message")))
+        (check-equal! (whatsapp--msg-sender (whatsapp--current-message t--wa-chat)) "Me" "next")
+        (with-current-buffer t--wa-chat (lambda () (run-command "whatsapp-prev-message")))
+        (check-equal! (whatsapp--msg-sender (whatsapp--current-message t--wa-chat)) "Mukund" "prev")
+        (check-contains! (value->string (buffer-local-value 'render-blocks t--wa-chat))
+                         "whatsapp-message-current" "the current one is marked")
+        (t--wa-reply! t--wa-chat "yes")
+        (check-contains! (value->string t--wa-sent) "> Mukund: are you around" "the quote")
+        (check-contains! (value->string t--wa-sent) "yes" "the text")))))
+
+(deftest 'whatsapp-a-late-answer-cannot-overwrite-a-newer-chat
+  "a transcript for the old jid is dropped when the buffer moved on"
+  (lambda ()
+    (t--wa! "whatsapp"
+      (lambda ()
+        (let ((late #f))
+          (buffer-create t--wa-chat)
+          (buffer-set-local! t--wa-chat 'whatsapp-jid "old@lid")
+          (set! *whatsapp-call* (lambda (server tool args &optional cb) (set! late cb) ""))
+          (whatsapp--refresh-conversation! t--wa-chat)
+          (buffer-set-local! t--wa-chat 'whatsapp-jid "new@lid")
+          (late #t "[2026-09-05 20:00:00] Chat: Old From: Old: stale response\n")
+          (check-false! (string-contains? (buffer-text t--wa-chat) "stale response") "no stale text")
+          (check-equal! (buffer-local-value 'whatsapp-jid t--wa-chat) "new@lid" "the new chat stays"))))))
+
+(deftest 'whatsapp-mode-setup-keeps-the-restored-conversation
+  "set-mode! again keeps the jid, so refresh still fetches the chat"
+  (lambda ()
+    (t--wa! "whatsapp"
+      (lambda ()
+        (t--wa-open-chat!)
+        (with-current-buffer t--wa-chat (lambda () (set-mode! "whatsapp-chat-mode")))
+        (with-current-buffer t--wa-chat (lambda () (run-command "whatsapp-chat-refresh")))
+        (check-equal! t--wa-message-fetches 2 "refresh fetched")
+        (check-contains! (buffer-text t--wa-chat) "it's the weekend" "the transcript")))))
