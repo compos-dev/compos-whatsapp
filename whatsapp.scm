@@ -4,6 +4,7 @@
 (require 'tabulated-list)
 (require 'groups)
 (require 'events)
+(require 'chat-surface)
 
 (package! "whatsapp")
 
@@ -119,10 +120,10 @@
 
 (define (whatsapp--clean-message-body body)
   (cond
-    ((string-prefix? "[image - Message ID:" body) "[image]")
+    ((string-prefix? "[image - Message ID:" body) "📷 Photo")
     ((string-prefix? "[video - Message ID:" body) "[video]")
     ((string-prefix? "[audio - Message ID:" body) "[audio]")
-    ((string-prefix? "[document - Message ID:" body) "[document]")
+    ((string-prefix? "[document - Message ID:" body) "📄 Document")
     (else body)))
 
 ;;; The conversation as a tree.
@@ -147,6 +148,71 @@
 (define (whatsapp--msg-sender row) (nth 3 row))
 (define (whatsapp--msg-body row) (nth 4 row))
 (define (whatsapp--msg-mine? row) (nth 5 row))
+(define (whatsapp--msg-raw row) (if (> (length row) 6) (nth 6 row) ""))
+
+(define whatsapp-media-directory
+  (string-append (compos-cache-dir) "/whatsapp-media"))
+
+(define (whatsapp--media-ref row)
+  "(KIND ID JID) of a photo or document message, from the line the server wrote for it, else #f"
+  (let ((m (re-match "^\\[(image|document) - Message ID: ([^ ]+) - Chat JID: ([^\\]]+)\\]"
+                     (whatsapp--msg-raw row))))
+    (and m (list (nth 1 m) (nth 2 m) (string-trim (nth 3 m))))))
+
+(define (whatsapp--photo-ref row)
+  "(ID JID) of a photo message, else #f"
+  (let ((ref (whatsapp--media-ref row)))
+    (and ref (equal? (car ref) "image") (cdr ref))))
+
+(define (whatsapp--doc-ref row)
+  "(ID JID) of a document message, else #f"
+  (let ((ref (whatsapp--media-ref row)))
+    (and ref (equal? (car ref) "document") (cdr ref))))
+
+;; a document keeps a folder of its own: the file under its own name, and
+;; preview.png, the first page as Quick Look draws it
+(define (whatsapp--doc-dir id)
+  (string-append whatsapp-media-directory "/" id))
+
+(define (whatsapp--doc-file row)
+  "the document of ROW as a local file once it is fetched, else #f"
+  (let* ((ref (whatsapp--doc-ref row))
+         (dir (and ref (whatsapp--doc-dir (car ref)))))
+    (and dir (file-directory? dir)
+         (let ((names (filter (lambda (f) (not (equal? f "preview.png")))
+                              (directory-files dir))))
+           (and (pair? names) (string-append dir "/" (car names)))))))
+
+(define (whatsapp--doc-preview row)
+  "the preview image of ROW's document once it is drawn, else #f"
+  (let ((ref (whatsapp--doc-ref row)))
+    (and ref
+         (let ((f (string-append (whatsapp--doc-dir (car ref)) "/preview.png")))
+           (and (file-exists? f) f)))))
+
+(define (whatsapp--media-local row)
+  "the photo or document of ROW as a local file, else #f"
+  (or (whatsapp--photo-local row) (whatsapp--doc-file row)))
+
+(define (whatsapp--body-shown row)
+  "what a bubble says: a fetched document by its file name"
+  (let ((doc (whatsapp--doc-file row)))
+    (if doc
+        (string-append "📄 " (file-name-nondirectory doc))
+        (whatsapp--msg-body row))))
+
+(define (whatsapp--sq s)
+  (string-append "'" (string-replace s "'" "'\\''") "'"))
+
+(define (whatsapp--photo-file id)
+  (string-append whatsapp-media-directory "/" id ".jpg"))
+
+(define (whatsapp--photo-local row)
+  "the photo of ROW as a local file once it is fetched, else #f"
+  (let ((ref (whatsapp--photo-ref row)))
+    (and ref
+         (let ((f (whatsapp--photo-file (car ref))))
+           (and (file-exists? f) f)))))
 
 ;; every message in BUF as (START END TIME SENDER BODY MINE?)
 (define (whatsapp--messages buf)
@@ -168,7 +234,12 @@
                   (string-trim
                     (whatsapp--slice text
                       (whatsapp--node-of "body" parts))))
-                (equal? sender "Me"))))
+                (equal? sender "Me")
+                ;; the body as the server wrote it: a photo's line names
+                ;; the message id its file is fetched by
+                (string-trim
+                  (whatsapp--slice text
+                    (whatsapp--node-of "body" parts))))))
           ;; Name the root. One message covers the whole buffer on its
           ;; own, and the smallest node over that range would then be
           ;; the message, not the conversation holding it.
@@ -203,27 +274,31 @@
       stamp))
 
 (define (whatsapp--message-block row current?)
-  (component 'ui/row
-    (list
-      'class
-        (string-append
-          "whatsapp-message"
-          (if (whatsapp--msg-mine? row) " whatsapp-message-me" "")
-          (if current? " whatsapp-message-current" ""))
-      ;; the node's own start names the row, so a click selects the
-      ;; message the same motion keys would
-      'click
-        (string-append "msg:"
-                       (number->string (whatsapp--msg-start row)))
-      'segs
-        (list
-          (list "whatsapp-message-time"
-                (whatsapp--short-time (whatsapp--msg-time row)))
-          (list "whatsapp-message-sender"
-                (string-append "  " (whatsapp--msg-sender row)))
-          ;; the body is its own block in the grid, so it needs no
-          ;; newline of its own
-          (list "whatsapp-message-body" (whatsapp--msg-body row))))))
+  (let ((mine? (whatsapp--msg-mine? row)))
+    (component 'ui/row
+      (list
+        'class
+          (string-append
+            "whatsapp-message"
+            (if mine? " whatsapp-message-me" "")
+            (if current? " whatsapp-message-current" ""))
+        ;; the node's own start names the row, so a click selects the
+        ;; message the same motion keys would
+        'click
+          (string-append "msg:"
+                         (number->string (whatsapp--msg-start row)))
+        ;; a bubble reads top to bottom: the sender (theirs only), the
+        ;; body, then the time tucked under it on the right
+        'segs
+          (append
+            (if mine?
+                '()
+                (list (list "whatsapp-message-sender"
+                            (whatsapp--msg-sender row))))
+            (list
+              (list "whatsapp-message-body" (whatsapp--body-shown row))
+              (list "whatsapp-message-time"
+                    (whatsapp--short-time (whatsapp--msg-time row)))))))))
 
 ;; WhatsApp's own reply carries the message it answers. This transport
 ;; has no field for one, so the quote goes into the text — the reader
@@ -241,28 +316,75 @@
         (loop (cdr words) (cons (car words) kept)
               (+ width 1 (string-byte-length (car words)))))))
 
-(define (whatsapp--conversation-blocks rows current notice)
-  (cons
-    (component 'ui/actions
-      (list 'class "whatsapp-actions"
-            'actions
-              '(("whatsapp-reply" "Reply" "r")
-                ("whatsapp-refresh" "Refresh" "g"))))
-    (if (pair? rows)
-        (map (lambda (row)
-               (whatsapp--message-block row
-                 (and current
-                      (= (whatsapp--msg-start row)
-                         (whatsapp--msg-start current)))))
-             rows)
-        (list
-          (component 'ui/empty
-            (list 'class "whatsapp-empty"
-                  'text
-                    (if (and (string? notice)
-                             (not (equal? (string-trim notice) "")))
-                        (string-trim notice)
-                        "No messages.")))))))
+(define (whatsapp--day-of stamp)
+  (if (>= (string-byte-length stamp) 10)
+      (substring-bytes stamp 0 10)
+      ""))
+
+(define (whatsapp--conversation-items rows current notice)
+  (if (pair? rows)
+      ;; a day pill goes in wherever the day changes, as Telegram does
+      (let loop ((rs rows) (day #f) (out '()))
+        (if (null? rs)
+            (reverse out)
+            (let* ((row (car rs))
+                   (d (whatsapp--day-of (whatsapp--msg-time row)))
+                   (pill (if (equal? d day)
+                             out
+                             (cons (component 'ui/row
+                                     (list 'class "whatsapp-day" 'text d))
+                                   out)))
+                   (here (and current
+                              (= (whatsapp--msg-start row)
+                                 (whatsapp--msg-start current))))
+                   (doc (whatsapp--doc-preview row))
+                   (photo (or (whatsapp--photo-local row) doc)))
+              (loop (cdr rs) d
+                    (cons (whatsapp--message-block row here)
+                          ;; a photo sits above its bubble, on the same side
+                          (if photo
+                              (cons (list 'tag "img"
+                                          'class (string-append
+                                                   "whatsapp-photo"
+                                                   (if doc " whatsapp-doc" "")
+                                                   (if (whatsapp--msg-mine? row)
+                                                       " whatsapp-photo-me" ""))
+                                          'file photo)
+                                    pill)
+                              pill))))))
+      (list
+        (component 'ui/empty
+          (list 'class "whatsapp-empty"
+                'text
+                  (if (and (string? notice)
+                           (not (equal? (string-trim notice) "")))
+                      (string-trim notice)
+                      "No messages."))))))
+
+(define (whatsapp--surface-frame buf)
+  "the chat interface's frame for a conversation: its actions, its bubbles and its reply field. WhatsApp sends the newest first; a chat reads oldest at the top, newest at the foot"
+  (let* ((rows (whatsapp--messages buf))
+         (current (or (whatsapp--shown-row buf rows)
+                      (whatsapp--message-at rows (buffer-point buf)))))
+    (list 'head
+          (list (component 'ui/actions
+                  (list 'class "whatsapp-actions"
+                        'actions '(("whatsapp-reply" "Reply")
+                                   ("whatsapp-refresh" "Refresh")))))
+          'items (whatsapp--conversation-items
+                   (reverse rows) current (buffer-local-value 'whatsapp-notice buf))
+          'prompt (list 'hint "Reply"))))
+
+(define (whatsapp--surface-spec)
+  (list 'mark 'whatsapp-input-mark
+        'draw whatsapp--surface-frame
+        ;; M-<up> and M-<down> walk the messages, not the drawn rows
+        'step (lambda (buf delta) (whatsapp--step! buf delta))
+        'send (lambda (buf text)
+                (chat-surface-clear-input! buf)
+                (whatsapp--send! buf text))))
+
+(chat-surface-kind! "whatsapp-chat-mode" (whatsapp--surface-spec))
 
 
 
@@ -288,9 +410,7 @@
     (let* ((rows (whatsapp--messages buf))
            (current (whatsapp--message-at rows (buffer-point buf))))
       (buffer-set-local! buf 'render-mode "blocks")
-      (buffer-set-local! buf 'render-blocks
-        (whatsapp--conversation-blocks rows current
-          (buffer-local-value 'whatsapp-notice buf)))
+      (chat-surface-redraw! buf)
       (buffer-set-local! buf 'modeline-info
         (string-append
           "WhatsApp · "
@@ -303,13 +423,15 @@
 ;; reads the buffer, so anything this rewrote would be a second
 ;; opinion about what was said.
 (define (whatsapp--render-conversation! buf raw)
-  (let ((text (if (string? raw) raw "")))
-    (whatsapp--replace-text! buf text)
+  (let* ((text (if (string? raw) raw ""))
+         ;; the reply field is the buffer's tail; a refresh keeps what is typed
+         (input (if (chat-surface-spec buf) (chat-surface-input-text buf) "")))
+    (whatsapp--replace-text! buf (string-append text input))
+    (buffer-set-local! buf 'whatsapp-input-mark (string-byte-length text))
     (buffer-set-local! buf 'whatsapp-notice text)
     (buffer-set-local! buf 'whatsapp-messages-jid
       (buffer-local-value 'whatsapp-jid buf))
-    (whatsapp--paint! buf)
-    (buffer-set-read-only! buf #t)))
+    (whatsapp--paint! buf)))
 
 ;; Motion belongs to the tree: the next message is the next sibling of
 ;; the node point stands in, and every mode with a grammar moves this
@@ -334,6 +456,85 @@
               (message (if (equal? op 'next)
                            "Last message"
                            "First message")))))))
+
+;; A conversation is walked by its messages: M-<up> and M-<down> bring the
+;; message before or after to the top of the window and mark it, and imenu
+;; lists every message. The drawn rows hold day pills and photos too, so a
+;; message's place among them is looked up by the start its bubble names.
+(define (whatsapp--items buf)
+  (plist-get (whatsapp--surface-frame buf) 'items))
+
+(define (whatsapp--bubble-start item)
+  (let ((c (and (pair? item) (plist-get item 'click))))
+    (and (string? c) (string-prefix? "msg:" c)
+         (string->number (substring c 4 (string-length c))))))
+
+(define (whatsapp--entry-index items start)
+  (let loop ((is items) (i 0))
+    (cond ((null? is) #f)
+          ((equal? (whatsapp--bubble-start (car is)) start) i)
+          (else (loop (cdr is) (+ i 1))))))
+
+(define (whatsapp--shown-row buf rows)
+  "the message M-<up>, M-<down> or imenu brought up, while the window stays there"
+  (let ((s (and (chat-surface-away? buf) (buffer-local-value 'whatsapp-shown buf))))
+    (and s (find (lambda (r) (= (whatsapp--msg-start r) s)) rows))))
+
+(define (whatsapp--show-entry! buf start)
+  "bring the message at START to the top of BUF's window, its photo with it, and mark it"
+  (let* ((items (whatsapp--items buf))
+         (idx (whatsapp--entry-index items start)))
+    (when idx
+      (buffer-set-local! buf 'whatsapp-shown start)
+      (chat-surface-place! buf
+        (if (and (> idx 0)
+                 (equal? (plist-get (list-ref items (- idx 1)) 'tag) "img"))
+            (- idx 1)
+            idx))
+      (buffer-set-local! buf 'chat-surface-nav idx)
+      (whatsapp--paint! buf))))
+
+(define (whatsapp--step! buf delta)
+  (let* ((items (whatsapp--items buf))
+         (bubbles (let loop ((is items) (i 0) (acc '()))
+                    (if (null? is)
+                        (reverse acc)
+                        (loop (cdr is) (+ i 1)
+                              (if (whatsapp--bubble-start (car is)) (cons i acc) acc)))))
+         (cur (and (chat-surface-away? buf) (buffer-local-value 'chat-surface-nav buf)))
+         (p (if (integer? cur) cur (length items)))
+         (target
+           (if (< delta 0)
+               (let ((before (filter (lambda (i) (< i p)) bubbles)))
+                 (and (pair? before) (car (last-pair before))))
+               (let ((after (filter (lambda (i) (> i p)) bubbles)))
+                 (and (pair? after) (car after))))))
+    (cond (target (whatsapp--show-entry! buf (whatsapp--bubble-start (list-ref items target))))
+          ((< delta 0) (message "First message"))
+          (else (buffer-set-local! buf 'whatsapp-shown #f)
+                (chat-surface-follow! buf)
+                (whatsapp--paint! buf)))
+    #t))
+
+(define (whatsapp--imenu-rows buf)
+  "(LINE KIND NAME DOC TARGET) for each message of BUF, oldest first; TARGET brings it up"
+  (let ((rows (whatsapp--messages buf)))
+    (filter (lambda (r) r)
+      (map (lambda (item)
+             (let* ((s (whatsapp--bubble-start item))
+                    (row (and s (find (lambda (r) (= (whatsapp--msg-start r) s)) rows))))
+               (and row
+                    (let ((name (string-append
+                                  (if (whatsapp--msg-mine? row) "Me" (whatsapp--msg-sender row))
+                                  ": " (whatsapp--one-line (whatsapp--body-shown row)))))
+                      (list (with-current-buffer buf (lambda () (line-number-at-pos s)))
+                            "message"
+                            (if (> (string-length name) 90)
+                                (string-append (substring name 0 89) "…")
+                                name)
+                            (whatsapp--short-time (whatsapp--msg-time row))
+                            (lambda () (whatsapp--show-entry! buf s)))))))
+           (whatsapp--items buf)))))
 
 (domain! 'chat)
 (effects! '(read external))
@@ -402,6 +603,58 @@
           (message "WhatsApp did not return a chat list")
           (k #f)))))
 
+(defcustom 'whatsapp-media-host "marilyn"
+  "The ssh host the WhatsApp bridge runs on. A photo is downloaded there and copied here to show in the conversation."
+  'group 'whatsapp 'type 'string)
+
+(defvar '*whatsapp-photos-pending* '())
+
+(define (whatsapp--fetch-photos! buf)
+  "fetch each photo and document of BUF's messages not here yet, off the lane, and redraw BUF as each one lands; a document gets a preview of its first page"
+  (for-each
+    (lambda (row)
+      (let ((ref (whatsapp--media-ref row)))
+        (when (and ref
+                   (not (whatsapp--media-local row))
+                   (not (member (cadr ref) *whatsapp-photos-pending*)))
+          (let* ((kind (car ref)) (id (cadr ref))
+                 (done! (lambda ()
+                          (set! *whatsapp-photos-pending*
+                                (filter (lambda (x) (not (equal? x id)))
+                                        *whatsapp-photos-pending*)))))
+            (set! *whatsapp-photos-pending* (cons id *whatsapp-photos-pending*))
+            (*whatsapp-call* 'whatsapp "download_media"
+              (list 'message_id id 'chat_jid (caddr ref))
+              (lambda (ok text)
+                (let* ((reply (and ok (string? text) (json-parse text)))
+                       (remote (and reply (plist-get reply 'file_path))))
+                  (if (not (string? remote))
+                      (done!)
+                      (let* ((doc? (equal? kind "document"))
+                             (dir (if doc? (whatsapp--doc-dir id) whatsapp-media-directory))
+                             (local (if doc?
+                                        (string-append dir "/" (file-name-nondirectory remote))
+                                        (whatsapp--photo-file id))))
+                        (make-directory! dir)
+                        (shell-command->string
+                          (string-append
+                            "ssh -o BatchMode=yes " whatsapp-media-host " "
+                            (whatsapp--sq (string-append "cat " (whatsapp--sq remote)))
+                            " > " (whatsapp--sq local) " 2>/dev/null"
+                            (if doc?
+                                (string-append
+                                  " && qlmanage -t -s 480 -o " (whatsapp--sq dir) " "
+                                  (whatsapp--sq local) " >/dev/null 2>&1; mv -f "
+                                  (whatsapp--sq (string-append local ".png")) " "
+                                  (whatsapp--sq (string-append dir "/preview.png"))
+                                  " 2>/dev/null")
+                                ""))
+                          dir
+                          (lambda (out)
+                            (done!)
+                            (when (buffer-known? buf) (whatsapp--paint! buf)))))))))))))
+    (whatsapp--messages buf)))
+
 (define (whatsapp--refresh-conversation! buf)
   (let ((jid (buffer-local-value 'whatsapp-jid buf)))
     (when jid
@@ -422,7 +675,8 @@
                   (string-append
                     "Could not load messages: "
                     (whatsapp--text text "unknown error")
-                    "\n")))))))))
+                    "\n")))
+            (when ok (whatsapp--fetch-photos! buf))))))))
 
 (define (whatsapp--display-conversation! buf)
   ;; Show the conversation without selecting its window; the index keeps
@@ -486,18 +740,21 @@
 
 (define-style! 'whatsapp
   "
-/* A log, not a chat app: one type size, one grid. The stamp is
-   11 cells wide and two cells of gutter follow it, so a body that
-   hangs at 13ch keeps its wrapped lines under the sender. */
+/* A chat, drawn the way Telegram draws one: bubbles on a quiet
+   ground, mine on the right in the accent, theirs on the left, a day
+   pill where the day changes. The text keeps the theme's own face. */
 .whatsapp-actions { padding: 2px 8px 8px; }
-.whatsapp-message { margin: 0; padding: 3px 9px; border-left: 2px solid transparent; font-family: var(--font-mono); font-size: 12px; line-height: 1.45; }
-.whatsapp-message-me { background: var(--hl-line-bg); border-left-color: var(--accent-fg); }
-.whatsapp-message-current { outline: 1px solid var(--accent-fg); outline-offset: -1px; }
-.whatsapp-message-time { color: var(--dim-fg); font-variant-numeric: tabular-nums; }
-.whatsapp-message-sender { color: var(--dim-fg); font-weight: 600; }
-.whatsapp-message-me .whatsapp-message-sender { color: var(--accent-fg); }
-.whatsapp-message-body { display: block; padding-left: 13ch; color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; }
-.whatsapp-empty { margin: 4px 8px; font-family: var(--font-mono); font-size: 12px; color: var(--dim-fg); }
+.whatsapp-day { display: block; width: fit-content; margin: 10px auto 6px; padding: 2px 10px; border-radius: 999px; font-size: 12px; color: var(--dim-fg); background: color-mix(in srgb, var(--fg) 10%, transparent); }
+.whatsapp-message { display: block; width: fit-content; max-width: min(74%, 64ch); margin: 3px 12px; padding: 6px 10px 4px; border-radius: 14px 14px 14px 4px; font-size: 13px; line-height: 1.4; background: color-mix(in srgb, var(--fg) 8%, transparent); }
+.whatsapp-message-me { margin-left: auto; border-radius: 14px 14px 4px 14px; background: color-mix(in srgb, var(--accent-fg) 24%, transparent); }
+.whatsapp-message-current { outline: 1px solid var(--accent-fg); outline-offset: 1px; }
+.whatsapp-message-sender { display: block; font-size: 12px; font-weight: 600; color: var(--accent-fg); }
+.whatsapp-message-body { display: block; color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; }
+.whatsapp-message-time { display: block; margin-top: 2px; text-align: right; font-size: 11px; color: var(--dim-fg); font-variant-numeric: tabular-nums; }
+.whatsapp-photo { display: block; width: auto; height: auto; max-width: min(45%, 220px); max-height: 220px; margin: 6px 12px 0; border-radius: 12px; object-fit: cover; }
+.whatsapp-photo-me { margin-left: auto; }
+.whatsapp-doc { object-fit: contain; object-position: top; background: #fff; border: 1px solid color-mix(in srgb, var(--fg) 15%, transparent); }
+.whatsapp-empty { margin: 4px 8px; font-size: 12px; color: var(--dim-fg); }
 ")
 
 (add-hook! (list 'block-click 'whatsapp)
@@ -530,11 +787,13 @@
       ;; before anything reads the buffer: every question below is a
       ;; question for the grammar
       (buffer-set-local! buf 'ts-lang "whatsapp")
-      (buffer-set-read-only! buf #t)
       (buffer-set-local! buf 'special #f)
       (buffer-set-local! buf 'desktop-skip-locals
         '(render-blocks whatsapp-notice whatsapp-messages-jid))
       (buffer-set-local! buf 'render-mode "blocks")
+      (buffer-set-local! buf 'imenu-index-function 'whatsapp--imenu-rows)
+      ;; the shared chat interface: the bubbles above, the reply field below
+      (chat-surface! buf (whatsapp--surface-spec))
       (cond
         (loaded? (whatsapp--paint! buf))
         (jid (whatsapp--refresh-conversation! buf))
@@ -561,6 +820,42 @@
 (domain! 'chat)
 (effects! '(read external))
 
+(defface! 'whatsapp-avatar-0 'fg "#ffffff" 'bg "#1f7a8c" 'weight "600")
+(defface! 'whatsapp-avatar-1 'fg "#ffffff" 'bg "#8a4b9e" 'weight "600")
+(defface! 'whatsapp-avatar-2 'fg "#ffffff" 'bg "#b8621b" 'weight "600")
+(defface! 'whatsapp-avatar-3 'fg "#ffffff" 'bg "#2e7d4f" 'weight "600")
+(defface! 'whatsapp-avatar-4 'fg "#ffffff" 'bg "#3b5bdb" 'weight "600")
+(defface! 'whatsapp-avatar-5 'fg "#ffffff" 'bg "#b23a48" 'weight "600")
+(defface! 'whatsapp-name 'weight "600")
+(defface! 'whatsapp-time 'fg "var(--dim-fg)")
+(defface! 'whatsapp-preview 'fg "var(--dim-fg)")
+
+(define (whatsapp--avatar-face name)
+  "the colour of a chat's avatar: one of six, fixed by its name"
+  (string-append "whatsapp-avatar-"
+    (number->string (modulo (apply + (map char->integer (string->list name))) 6))))
+
+(define (whatsapp--initials name)
+  "the one or two letters an avatar shows: the first of the first two words"
+  (let* ((words (filter (lambda (w) (not (equal? w ""))) (string-split name " ")))
+         (letters (apply string-append
+                    (map (lambda (w) (substring-bytes w 0 1)) (take words 2)))))
+    (if (equal? letters "") "?" (string-upcase letters))))
+
+(define (whatsapp--row-cells buf chat)
+  (let* ((jid (whatsapp--text (plist-get chat 'jid) "unknown"))
+         (name (whatsapp--text (plist-get chat 'name) jid)))
+    (list
+      (list (list (whatsapp--initials name) (whatsapp--avatar-face name))
+            (list name "whatsapp-name")
+            (list (whatsapp--list-time (plist-get chat 'last_message_time))
+                  "whatsapp-time"))
+      (list ""
+            (list (string-append
+                    (if (whatsapp--from-me? chat) "me: " "")
+                    (whatsapp--one-line (plist-get chat 'last_message)))
+                  "whatsapp-preview")))))
+
 (define-list-mode! "whatsapp-mode"
   (list
     'doc (string-append
@@ -573,10 +868,13 @@
             (list-entries buf))
     'cache-fetch whatsapp--fetch-chats
     'cache-ttl whatsapp-cache-ttl
-    'columns (lambda (buf)
-               (list (list "chat" 22) (list "last active" 16)
-                     (list "message" #f)))
-    'cells whatsapp--cells
+    ;; two lines a chat: the avatar and the name with the time, then the
+    ;; last message under them, as WhatsApp lays a chat out
+    'row-columns (lambda (buf)
+                   (list (list (list "" 3 'left) (list "chat" #f 'left)
+                               (list "when" 10 'right))
+                         (list (list "" 3 'left) (list "message" #f 'left))))
+    'row-cells whatsapp--row-cells
     'title (lambda (buf) "WhatsApp chats")
     'meta (lambda (buf)
             (string-append
@@ -589,10 +887,11 @@
     'debounce #t
     'key (lambda (buf chat) (plist-get chat 'jid))
     'footer (lambda (buf)
-              '(("RET" "read") ("r" "reply") ("/" "filter")
+              '(("RET" "read") ("r" "reply") ("s" "search") ("/" "filter")
                 ("g" "refresh") ("q" "quit")))
     'keys '(("RET" "whatsapp-open")
             ("r" "whatsapp-reply")
+            ("s" "whatsapp-search")
             ("g" "whatsapp-refresh")
             ("q" "quit-window"))))
 
@@ -643,6 +942,116 @@
 (domain! 'chat)
 (effects! '(read external))
 
+(defvar '*whatsapp-people* #f)      ; (AT ROWS): the last search list and when it was read
+
+(define (whatsapp--contact-name c)
+  (let ((pick (lambda (k) (let ((v (plist-get c k))) (and (string? v) (not (equal? (string-trim v) "")) (string-trim v))))))
+    (or (pick 'full_name) (pick 'push_name) (pick 'business_name))))
+
+(define (whatsapp--jid-number jid)
+  (car (string-split (whatsapp--text jid "") "@")))
+
+(define (whatsapp--people chats contacts lids)
+  "one row (LABEL JID NAME) per person: the chats first, newest first, then the contacts never written to. LIDS is ((LID PN) ...): a chat under a linked id takes its name from the contact of its number"
+  (let* ((contact-name
+           (lambda (num)
+             (let ((c (find (lambda (c) (equal? (whatsapp--jid-number (plist-get c 'jid)) num)) contacts)))
+               (and c (whatsapp--contact-name c)))))
+         (pn-of (lambda (jid)
+                  (let ((num (whatsapp--jid-number jid)))
+                    (if (string-suffix? "@lid" jid)
+                        (let ((m (assoc num lids))) (and m (cadr m)))
+                        (and (string-suffix? "@s.whatsapp.net" jid) num)))))
+         (chat-rows
+           (filter (lambda (r) r)
+             (map (lambda (c)
+                    (let* ((jid (plist-get c 'jid))
+                           (pn (and (string? jid) (pn-of jid)))
+                           (own (whatsapp--text (plist-get c 'name) ""))
+                           (name (if (or (equal? own "") (not (re-find "[^0-9+ ]" own 0)))
+                                     (or (and pn (contact-name pn)) (and (not (equal? own "")) own))
+                                     own)))
+                      (and (string? jid) name
+                           (not (string-suffix? "@broadcast" jid))
+                           (list (string-append name "  · "
+                                   (cond ((string-suffix? "@g.us" jid) "group")
+                                         (pn (string-append "+" pn))
+                                         (else "chat")))
+                                 jid name pn))))
+                  chats)))
+         ;; one row a person: a number with two chats keeps its newest
+         (chat-rows
+           (let loop ((rs chat-rows) (seen '()) (out '()))
+             (cond ((null? rs) (reverse out))
+                   ((let ((key (or (cadddr (car rs)) (cadr (car rs))))) (member key seen))
+                    (loop (cdr rs) seen out))
+                   (else (loop (cdr rs) (cons (or (cadddr (car rs)) (cadr (car rs))) seen)
+                               (cons (car rs) out))))))
+         (written (filter (lambda (x) x) (map cadddr chat-rows)))
+         (contact-rows
+           (filter (lambda (r) r)
+             (map (lambda (c)
+                    (let* ((jid (plist-get c 'jid)) (name (whatsapp--contact-name c))
+                           (num (and (string? jid) (whatsapp--jid-number jid))))
+                      (and (string? jid) name
+                           (string-suffix? "@s.whatsapp.net" jid)
+                           (not (member num written))
+                           (list (string-append name "  · +" num) jid name num))))
+                  contacts))))
+    (append chat-rows contact-rows)))
+
+(defcustom 'whatsapp-bridge-store "/home/svs/src/mcp/whatsapp-mcp/whatsapp-bridge/store"
+  "The bridge's store folder on whatsapp-media-host. Its whatsapp.db maps each linked id to a phone number."
+  'group 'whatsapp 'type 'string)
+
+(define (whatsapp--lid-map k)
+  "K gets ((LID PN) ...), read off the lane from the bridge's database; '() when it cannot be read"
+  (shell-command->string
+    (string-append "ssh -o BatchMode=yes " whatsapp-media-host " "
+      (whatsapp--sq (string-append "sqlite3 " (whatsapp--sq (string-append whatsapp-bridge-store "/whatsapp.db"))
+                                   " 'select lid, pn from whatsmeow_lid_map'"))
+      " 2>/dev/null")
+    (default-directory)
+    (lambda (out)
+      (k (filter (lambda (p) (= (length p) 2))
+                 (map (lambda (l) (string-split l "|"))
+                      (string-split (whatsapp--text out "") "\n")))))))
+
+(define (whatsapp--with-people k)
+  "K gets the people rows: the list read in the last five minutes, else read again off the lane"
+  (let ((cached *whatsapp-people*))
+    (if (and cached (< (- (current-time) (car cached)) 300))
+        (k (cadr cached))
+        (begin
+          (message "Reading WhatsApp contacts…")
+          (*whatsapp-call* 'whatsapp "list_chats"
+            (list 'limit 2000 'page 0 'sort_by "last_active")
+            (lambda (ok chats)
+              (*whatsapp-call* 'whatsapp "list_all_contacts" (list)
+                (lambda (ok2 contacts)
+                  (whatsapp--lid-map
+                    (lambda (lids)
+                      (let ((rows (whatsapp--people
+                                    (or (and ok (whatsapp--parse-chats chats)) '())
+                                    (or (and ok2 (whatsapp--parse-chats contacts)) '())
+                                    lids)))
+                        (set! *whatsapp-people* (list (current-time) rows))
+                        (k rows))))))))))))
+
+(define-command "whatsapp-search" "Find anyone on WhatsApp, a chat or a contact, and open the conversation"
+  (lambda ()
+    (with-current-buffer *whatsapp-buffer*
+      (lambda ()
+        (whatsapp--with-people
+          (lambda (rows)
+            (completing-read "WhatsApp: " (map car rows)
+              (lambda (label)
+                (let ((row (assoc label rows)))
+                  (if row
+                      (whatsapp--open-chat! (list 'jid (cadr row) 'name (caddr row)) #t)
+                      (message "No one by that name"))))
+              'require-match #t 'category 'whatsapp-person)))))))
+
 (define-command "whatsapp-refresh" "Refresh recent WhatsApp chats"
   (lambda ()
     (message "Refreshing WhatsApp chats…")
@@ -684,6 +1093,10 @@
 
 (mode-icon! "whatsapp-mode" "W")
 (mode-icon! "whatsapp-chat-mode" "W")
+
+;; A conversation is a chat: the Cmd- and Shift-arrows stay the window
+;; motion after you type a reply, as they do in chat-mode.
+(editing-state-maps-off! "whatsapp-chat-mode" '("editing-caret-map" "cua-mode-map"))
 
 
 ;;; The feed: every WhatsApp message becomes a "whatsapp:<chat jid>" event
