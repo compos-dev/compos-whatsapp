@@ -32,7 +32,31 @@
   (let ((group (frame-group)))
     (when group (buffer-add-group! buf group)))
   buf)
-(define *whatsapp-call* mcp-call!)
+(define (whatsapp--stale-session? text)
+  (and (string? text) (string-contains? text "http 404")))
+
+(define (whatsapp--reconnect! server)
+  (mcp-disconnect! (symbol->string server))
+  (mcp-ensure! server))
+
+;; The server on the bridge's host forgets its sessions when it restarts,
+;; and answers the old one 404. A call that meets that connects again and
+;; tries once more, so a restart there never leaves WhatsApp broken here.
+(define (whatsapp--mcp-call server tool args &optional cb)
+  (if cb
+      (mcp-call! server tool args
+        (lambda (ok text)
+          (if (and (not ok) (whatsapp--stale-session? text))
+              (begin (whatsapp--reconnect! server)
+                     (mcp-call! server tool args cb))
+              (cb ok text))))
+      (let ((first (ignore-errors (lambda () (mcp-call! server tool args)))))
+        (if (and first (not (whatsapp--stale-session? first)))
+            first
+            (begin (whatsapp--reconnect! server)
+                   (mcp-call! server tool args))))))
+
+(define *whatsapp-call* whatsapp--mcp-call)
 (effects! '(write external))
 (public! '*whatsapp-call* "(*whatsapp-call* SERVER TOOL ARGS [CB]) — the MCP call that WhatsApp uses; tests set it to a stub")
 
@@ -586,11 +610,15 @@
 
 (define (whatsapp--fetch-chats buf k)
   (let* ((text
-           (*whatsapp-call* 'whatsapp "list_chats"
-             (list 'limit whatsapp-chat-limit
-                   'page 0
-                   'include_last_message #t
-                   'sort_by "last_active")))
+           ;; an error answers no rows, so the cache's refresh finishes and
+           ;; the next g reads again instead of waiting on a dead fetch
+           (report-errors "whatsapp"
+             (lambda ()
+               (*whatsapp-call* 'whatsapp "list_chats"
+                 (list 'limit whatsapp-chat-limit
+                       'page 0
+                       'include_last_message #t
+                       'sort_by "last_active")))))
          (rows (whatsapp--parse-chats text)))
     (if rows
         (let ((rows (whatsapp--enrich-chats rows)))
