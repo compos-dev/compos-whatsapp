@@ -419,6 +419,11 @@
         'draw whatsapp--surface-frame
         ;; M-<up> and M-<down> walk the messages, not the drawn rows
         'step (lambda (buf delta) (whatsapp--step! buf delta))
+        ;; up and down walk the messages too while the reply is empty;
+        ;; with text typed they recall what was sent, as in any chat
+        'walk (lambda (buf dir)
+                (and (equal? (string-trim (chat-surface-input-text buf)) "")
+                     (whatsapp--step! buf dir)))
         'send (lambda (buf text)
                 (chat-surface-clear-input! buf)
                 (whatsapp--send! buf text))))
@@ -463,8 +468,13 @@
 ;; opinion about what was said.
 (define (whatsapp--render-conversation! buf raw)
   (let* ((text (if (string? raw) raw ""))
-         ;; the reply field is the buffer's tail; a refresh keeps what is typed
-         (input (if (chat-surface-spec buf) (chat-surface-input-text buf) "")))
+         ;; the reply field is the buffer's tail; a refresh keeps what is typed.
+         ;; A tail that reads as transcript is a chat left behind by a mark
+         ;; that went stale, never a reply: it goes, so two chats never mix
+         (typed (if (chat-surface-spec buf) (chat-surface-input-text buf) ""))
+         (input (if (re-find "\\[\\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d:\\d\\d\\] Chat: " typed 0)
+                    ""
+                    typed)))
     (whatsapp--replace-text! buf (string-append text input))
     (buffer-set-local! buf 'whatsapp-input-mark (string-byte-length text))
     (buffer-set-local! buf 'whatsapp-notice text)
