@@ -698,10 +698,11 @@
                             (when (buffer-known? buf) (whatsapp--paint! buf)))))))))))))
     (whatsapp--messages buf)))
 
-(define (whatsapp--refresh-conversation! buf)
+(define (whatsapp--refresh-conversation! buf &optional quiet)
+  "read BUF's chat again; QUIET keeps the messages on screen while it reads, as a live update does"
   (let ((jid (buffer-local-value 'whatsapp-jid buf)))
     (when jid
-      (whatsapp--render-conversation! buf "Loading messages…\n")
+      (unless quiet (whatsapp--render-conversation! buf "Loading messages…\n"))
       (*whatsapp-call* 'whatsapp "list_messages"
         (list 'chat_jid jid
               'limit whatsapp-message-limit
@@ -1298,4 +1299,20 @@
                        'jid (plist-get d 'chat)))))))
 
 (event-subscribe! "whatsapp-notify" "whatsapp:*" 'whatsapp-notify--saw)
+
+;; Live: a message the feed logs redraws what shows it. The open
+;; conversation reads its chat again when the message is in it, and the
+;; chat list reads again, so neither waits for g.
+(define (whatsapp--live-saw e)
+  (let ((chat (plist-get (plist-get e 'data) 'chat))
+        (conv *whatsapp-show-buffer*))
+    (when (and (buffer-known? conv)
+               (string? chat)
+               (equal? chat (buffer-local-value 'whatsapp-jid conv)))
+      ;; the server is reached as the buffer that shows it, whose group holds it
+      (with-current-buffer conv (lambda () (whatsapp--refresh-conversation! conv #t))))
+    (when (buffer-known? *whatsapp-buffer*)
+      (with-current-buffer *whatsapp-buffer* (lambda () (cache-refresh! *whatsapp-buffer*))))))
+
+(event-subscribe! "whatsapp-live" "whatsapp:*" 'whatsapp--live-saw)
 
