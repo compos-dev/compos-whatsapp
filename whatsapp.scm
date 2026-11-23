@@ -142,13 +142,21 @@
         (if (whatsapp--from-me? chat) "me: " "")
         (whatsapp--one-line (plist-get chat 'last_message))))))
 
+(define whatsapp--reactions-pattern "\\s*\\[reactions: ([^\\]]*)\\]\\s*$")
+
+(define (whatsapp--strip-reactions body)
+  "BODY without the reactions the server writes after it"
+  (let ((at (re-find whatsapp--reactions-pattern body 0)))
+    (if at (substring body 0 (car at)) body)))
+
 (define (whatsapp--clean-message-body body)
-  (cond
-    ((string-prefix? "[image - Message ID:" body) "📷 Photo")
-    ((string-prefix? "[video - Message ID:" body) "[video]")
-    ((string-prefix? "[audio - Message ID:" body) "[audio]")
-    ((string-prefix? "[document - Message ID:" body) "📄 Document")
-    (else body)))
+  (let ((body (whatsapp--strip-reactions body)))
+    (cond
+      ((string-prefix? "[image - Message ID:" body) "📷 Photo")
+      ((string-prefix? "[video - Message ID:" body) "[video]")
+      ((string-prefix? "[audio - Message ID:" body) "[audio]")
+      ((string-prefix? "[document - Message ID:" body) "📄 Document")
+      (else body))))
 
 ;;; The conversation as a tree.
 ;;;
@@ -173,6 +181,10 @@
 (define (whatsapp--msg-body row) (nth 4 row))
 (define (whatsapp--msg-mine? row) (nth 5 row))
 (define (whatsapp--msg-raw row) (if (> (length row) 6) (nth 6 row) ""))
+(define (whatsapp--msg-reactions row)
+  "the reactions on ROW as the server lists them, as \"👍 Shouvik, ❤️ Me\", else #f"
+  (let ((m (re-match whatsapp--reactions-pattern (whatsapp--msg-raw row))))
+    (and m (not (equal? (string-trim (nth 1 m)) "")) (string-trim (nth 1 m)))))
 
 (define whatsapp-media-directory
   (string-append (compos-cache-dir) "/whatsapp-media"))
@@ -320,7 +332,10 @@
                 (list (list "whatsapp-message-sender"
                             (whatsapp--msg-sender row))))
             (list
-              (list "whatsapp-message-body" (whatsapp--body-shown row))
+              (list "whatsapp-message-body" (whatsapp--body-shown row)))
+            (let ((r (whatsapp--msg-reactions row)))
+              (if r (list (list "whatsapp-message-reactions" r)) '()))
+            (list
               (list "whatsapp-message-time"
                     (whatsapp--short-time (whatsapp--msg-time row)))))))))
 
@@ -782,6 +797,7 @@
 .whatsapp-photo { display: block; width: auto; height: auto; max-width: min(45%, 220px); max-height: 220px; margin: 6px 12px 0; border-radius: 12px; object-fit: cover; }
 .whatsapp-photo-me { margin-left: auto; }
 .whatsapp-doc { object-fit: contain; object-position: top; background: #fff; border: 1px solid color-mix(in srgb, var(--fg) 15%, transparent); }
+.whatsapp-message-reactions { display: inline-block; margin-top: 3px; padding: 1px 7px; border-radius: 999px; font-size: 12px; color: var(--fg); background: color-mix(in srgb, var(--fg) 12%, transparent); }
 .whatsapp-empty { margin: 4px 8px; font-size: 12px; color: var(--dim-fg); }
 ")
 
