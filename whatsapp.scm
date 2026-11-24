@@ -626,11 +626,19 @@
     (set! *whatsapp-details* '())
     (set! *whatsapp-details-at* (current-time)))
   (map (lambda (chat)
-         (if (whatsapp--needs-detail? chat)
-             (or (report-errors "whatsapp: chat detail"
-                                (lambda () (whatsapp--fill-chat chat)))
-                 chat)
-             chat))
+         (let ((chat (if (whatsapp--needs-detail? chat)
+                         (or (report-errors "whatsapp: chat detail"
+                                            (lambda () (whatsapp--fill-chat chat)))
+                             chat)
+                         chat)))
+           ;; the status feed is named after whoever posted last; it is the feed
+           (if (equal? (plist-get chat 'jid) "status@broadcast")
+               (append (list 'name "Status updates")
+                       (let strip ((p chat))
+                         (cond ((null? p) '())
+                               ((eq? (car p) 'name) (strip (cddr p)))
+                               (else (cons (car p) (cons (cadr p) (strip (cddr p))))))))
+               chat)))
        rows))
 
 (define (whatsapp--fetch-chats buf k)
@@ -891,11 +899,14 @@
     (number->string (modulo (apply + (map char->integer (string->list name))) 6))))
 
 (define (whatsapp--initials name)
-  "the one or two letters an avatar shows: the first of the first two words"
-  (let* ((words (filter (lambda (w) (not (equal? w ""))) (string-split name " ")))
-         (letters (apply string-append
-                    (map (lambda (w) (substring-bytes w 0 1)) (take words 2)))))
-    (if (equal? letters "") "?" (string-upcase letters))))
+  "the one or two letters an avatar shows: the first of the first two words; a number shows its last two digits"
+  (if (re-match "^\\+?[0-9 ]+$" name)
+      (let ((digits (string-replace (string-replace name "+" "") " " "")))
+        (substring digits (max 0 (- (string-length digits) 2)) (string-length digits)))
+      (let* ((words (filter (lambda (w) (not (equal? w ""))) (string-split name " ")))
+             (letters (apply string-append
+                        (map (lambda (w) (substring-bytes w 0 1)) (take words 2)))))
+        (if (equal? letters "") "?" (string-upcase letters)))))
 
 (define (whatsapp--row-cells buf chat)
   (let* ((jid (whatsapp--text (plist-get chat 'jid) "unknown"))
