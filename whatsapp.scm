@@ -1304,7 +1304,9 @@
 (define (whatsapp-notify--saw e)
   "a received message, other than a status update, makes a notice: the chat, then the first line"
   (let ((d (plist-get e 'data)))
+    ;; notify! comes from the notifications package, which a server may not have
     (when (and whatsapp-notify
+               (boundp 'notify!)
                (eq? (plist-get e 'kind) 'received)
                (not (equal? (plist-get d 'chat) "status@broadcast")))
       (let ((text (whatsapp-notify--text (plist-get d 'text)))
@@ -1327,12 +1329,13 @@
 (define (whatsapp--live-saw e)
   (let ((chat (plist-get (plist-get e 'data) 'chat))
         (conv *whatsapp-show-buffer*))
-    (when (and (buffer-known? conv)
+    ;; only a buffer that is awake is redrawn: entering one that is asleep fails
+    (when (and (buffer-exists? conv)
                (string? chat)
                (equal? chat (buffer-local-value 'whatsapp-jid conv)))
       ;; the server is reached as the buffer that shows it, whose group holds it
       (with-current-buffer conv (lambda () (whatsapp--refresh-conversation! conv #t))))
-    (when (buffer-known? *whatsapp-buffer*)
+    (when (buffer-exists? *whatsapp-buffer*)
       (with-current-buffer *whatsapp-buffer* (lambda () (cache-refresh! *whatsapp-buffer*))))))
 
 (event-subscribe! "whatsapp-live" "whatsapp:*" 'whatsapp--live-saw)
